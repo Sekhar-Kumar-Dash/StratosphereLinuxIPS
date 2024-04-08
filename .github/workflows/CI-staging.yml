@@ -1,60 +1,81 @@
-# This workflow will install Slips dependencies and run unit tests
-
-name: CI-staging
+name: CI-production
 
 on:
-    push:
-        branches:
-            # features will be added to this branch using PRs, not need to re-run the tests on push
-            - '!develop'
-            - '!master'
-    pull_request:
-        branches:
-            - 'develop'
-            - '!master'
+  pull_request:
+    branches:
+    - 'master'
+    - '!develop'
 
 jobs:
 
-    run_tests:
-        # specify the host OS
-        runs-on: ubuntu-latest
-        # 2 hours timeout
-        timeout-minutes: 7200
-        # start a container using slips dependencies image
-        container:
-            image: stratosphereips/slips_dependencies:latest
-
-        steps:
-            - uses: actions/checkout@v2
-
-            - name: Start redis server
-              run: redis-server --daemonize yes
-
-            - name: Run unit tests
-              run: python3  -m pytest tests/  --ignore="tests/test_daemon.py" --ignore="tests/test_database.py" --ignore="tests/integration_tests" -n 7 -p no:warnings -vv -s
-
-            - name: Run database unit tests
-              run: python3  -m pytest tests/test_database.py -p no:warnings -vv
+  test_slips_locally:
+    # runs the tests on a GH VM
+    runs-on: ubuntu-20.04
+    # 2 hours timeout
+    timeout-minutes: 7200
 
 
-            - name: Clear redis cache
-              run: ./slips.py -cc
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        ref: 'develop'
+        # Fetch all history for all tags and branches
+        fetch-depth: ''
 
-            - name: Portscan tests
-              run: python3 -m pytest -s tests/integration_tests/test_portscans.py  -p no:warnings -vv
+    - name: Install slips dependencies
+      run: sudo apt-get update --fix-missing && sudo apt-get -y --no-install-recommends install python3 redis-server python3-pip python3-certifi python3-dev build-essential file lsof net-tools iproute2 iptables python3-tzlocal nfdump tshark git whois golang nodejs notify-osd yara libnotify-bin
 
-            - name: Integration tests
-              run: python3 -m pytest -s tests/integration_tests/test_dataset.py -p no:warnings -vv
+    - name: Install Zeek
+      run: |
+        sudo echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_20.04/ /' | sudo tee /etc/apt/sources.list.d/security:zeek.list
+        curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_20.04/Release.key | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+        sudo apt update
+        sudo apt install -y --no-install-recommends zeek
+        sudo ln -s /opt/zeek/bin/zeek /usr/local/bin/bro
 
-            - name: Config file tests
-              run: python3 -m pytest -s tests/integration_tests/test_config_files.py  -p no:warnings -vv
+    - name: Set up Python 3.8
+      uses: actions/setup-python@v2
+      with:
+        python-version: "3.8"
+
+    - name: Install Python dependencies
+      run:
+        python -m pip install --upgrade pip
+        pip install -r install/requirements.txt
+        pip install coverage
+
+    - name: Start redis server
+      run: redis-server --daemonize yes
+
+    - name: Run unit tests
+      run: coverage run --source=./ -m pytest tests/ --ignore="tests/test_database.py" --ignore="tests/integration_tests" -n 7 -p no:warnings -vv -s
 
 
-            - name: Upload Artifact
-              # run this job whether the above jobs failed or passed
-              if: success() || failure()
-              uses: actions/upload-artifact@v3
-              with:
-                name: integration-tests-output
-                path: |
-                  output/integration_tests
+    - name: Run database unit tests
+      run: coverage run --source=./ -m pytest tests/test_database.py -p no:warnings -vv
+
+    - name: Clear redis cache
+      run: ./slips.py -cc
+
+    - name: Portscan tests
+      run:  coverage run --source=./ -m pytest -s tests/integration_tests/test_portscans.py -p no:warnings -vv
+
+    - name: Integration tests
+      run: coverage run --source=./ -m pytest -s tests/integration_tests/test_dataset.py -p no:warnings -vv
+
+    - name: Config file tests
+      run: coverage run --source=./ -m pytest -s tests/integration_tests/test_config_files.py -p no:warnings -vv
+
+    - name: Generate coverage report
+      run: |
+        coverage xml -o coverage.xml
+
+    - name: Upload Artifact
+      # run this job whether the above jobs failed or passed
+      if: success() || failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test_slips_locally-integration-tests-output
+        path: |
+          output/integration_tests
+          coverage.xml
