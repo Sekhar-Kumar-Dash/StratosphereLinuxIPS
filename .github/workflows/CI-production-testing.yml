@@ -175,7 +175,10 @@ jobs:
 #        coverage report --include="dataset/*"
 #        coverage html --include="dataset/*" -d coverage_reports/dataset
 
-
+    - name: set evidence test
+      run: |
+        coverage run --source=./ -m pytest tests/test_set_evidence.py -p no:warnings -vv
+         
     - name: Config file tests
       run: |
         python3 -m pytest -s tests/integration_tests/test_config_files.py  -p no:warnings -vv
