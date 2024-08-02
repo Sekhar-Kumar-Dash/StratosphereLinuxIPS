@@ -1,208 +1,394 @@
+"""Unit test for modules/ip_info/ip_info.py"""
+
+from tests.module_factory import ModuleFactory
+import pytest
+from unittest.mock import Mock, patch, call
 import time
-import ipaddress
-import ipwhois
 import json
-import requests
-import maxminddb
-
-from slips_files.common.slips_utils import utils
 
 
-class ASN:
-    def __init__(self, db=None):
-        self.db = db
-        # Open the maxminddb ASN offline db
-        try:
-            self.asn_db = maxminddb.open_database(
-                "databases/GeoLite2-ASN.mmdb"
-            )
-        except Exception:
-            # errors are printed in IP_info
-            pass
+@pytest.mark.parametrize(
+    "ip_address, expected_asn_info",
+    [
+        # Testcase 1: IP with known ASN info
+        (
+                "108.200.116.255",
+                {"asn": {"number": "AS7018", 
+                         "org": "ATT-INTERNET4"}},
+        ),
+        # Testcase 2: IP with no ASN info
+        (
+                "0.0.0.0",
+                {},
+        ),
+        # Testcase 3: Private IP address
+        (
+                "192.168.1.1",
+                {},
+        ),
+    ],
+)
+def test_get_asn_info_from_geolite(mock_db, ip_address, 
+                                   expected_asn_info):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
+    assert (asn_info.get_asn_info_from_geolite(ip_address) == 
+            expected_asn_info)
 
-    def get_cached_asn(self, ip):
-        """
-        If this ip belongs to a cached ip range, return the cached asn info of it
-        :param ip: str
-        if teh range of this ip was found, this function returns a dict with {'number' , 'org'}
-        """
-        first_octet: str = utils.get_first_octet(ip)
-        if not first_octet:
-            # invalid ip or no cached asns
-            return
 
-        cached_asn: str = self.db.get_asn_cache(first_octet=first_octet)
-        if not cached_asn:
-            return
+@pytest.mark.parametrize(
+    "ip_address, expected_cached_data",
+    [  # Testcase 1: Cache miss, successful ASN lookup
+        (
+                "8.8.8.8",
+                {"asn": {"number": "AS15169", "org": "GOOGLE, US"}},
+        ),
+        # Testcase 2: Cache miss, successful ASN lookup, different IP
+        (
+                "1.1.1.1",
+                {"asn": {"number": "AS13335", 
+                         "org": "CLOUDFLARENET, US"}},
+        ),
+        # Testcase 3: Cache hit, return cached data
+        ("8.8.8.8", {"asn": {"number": "AS15169", 
+                             "org": "GOOGLE, US"}}),
+    ],
+)
+def test_cache_ip_range(mock_db, ip_address, 
+                        expected_cached_data):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
+    asn_info.cache_ip_range(ip_address)
+    assert (asn_info.cache_ip_range(ip_address) == 
+            expected_cached_data)
 
-        cached_asn: dict = json.loads(cached_asn)
 
-        for range, range_info in cached_asn.items():
-            # convert to objects
-            ip_range = ipaddress.ip_network(range)
-            ip = ipaddress.ip_address(ip)
-            if ip in ip_range:
-                asn_info = {
-                    "asn": {
-                        "org": range_info["org"],
-                    }
-                }
-                if "number" in range_info:
-                    asn_info["asn"].update({"number": range_info["number"]})
-                return asn_info
+@pytest.mark.parametrize(
+    "ip_address, first_octet, cached_data, expected_result",
+    [
+        # Testcase 1: IP in cached range
+        (
+                "192.168.1.100",
+                "192",
+                json.dumps(
+                    {"192.168.0.0/16": 
+                         {"org": "Test Org", "number": "AS12345"}}
+                ),
+                {"asn": 
+                     {"org": "Test Org", "number": "AS12345"}},
+        ),
+        # Testcase 2: IP not in cached range
+        (
+                "10.0.0.1",
+                "10",
+                json.dumps(
+                    {"192.168.0.0/16": 
+                         {"org": "Test Org", "number": "AS12345"}}
+                ),
+                None,
+        ),
+        # Testcase 3: No cached data for first octet
+        (
+                "172.16.0.1",
+                "172",
+                None,
+                None,
+        ),
+        # Testcase 4: Invalid IP
+        (
+                "invalid_ip",
+                None,
+                None,
+                None,
+        ),
+        # Testcase 5: Cached range without 'number'
+        (
+                "192.168.1.100",
+                "192",
+                json.dumps({"192.168.0.0/16": {"org": "Test Org"}}),
+                {"asn": {"org": "Test Org"}},
+        ),
+    ],
+)
+def test_get_cached_asn(
+        mock_db, ip_address, first_octet, cached_data, expected_result
+):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
 
-    def update_asn(self, cached_data, update_period) -> bool:
-        """
-        Returns True if
-        - no asn data is found in the db OR ip has no cached info
-        - OR a month has passed since we last updated asn info in the db
-        :param cached_data: ip cached info from the database, dict
-        """
-        try:
-            return (
-                time.time() - cached_data["asn"]["timestamp"]
-            ) > update_period
-        except (KeyError, TypeError):
-            # no there's no cached asn info,or no timestamp, or cached_data is None
-            # we should update
-            return True
+    with patch(
+            "slips_files.common.slips_utils.utils.get_first_octet"
+    ) as mock_get_first_octet:
+        mock_get_first_octet.return_value = first_octet
 
-    def get_asn_info_from_geolite(self, ip) -> dict:
-        """
-        Get ip info from geolite database
-        :param ip: str
-        return a dict with {'asn': {'org':.. , 'number': 'AS123'}}
-        """
-        ip_info = {}
-        if not hasattr(self, "asn_db"):
-            return ip_info
+        mock_db.get_asn_cache.return_value = cached_data
 
-        asninfo = self.asn_db.get(ip)
+        result = asn_info.get_cached_asn(ip_address)
+        assert result == expected_result
 
-        try:
-            # found info in geolite
-            org = asninfo["autonomous_system_organization"]
-            number = f'AS{asninfo["autonomous_system_number"]}'
 
-            ip_info["asn"] = {"org": org, "number": number}
-        except (KeyError, TypeError):
-            # asn info not found in geolite
-            pass
+@pytest.mark.parametrize(
+    "cached_data, update_period, expected_result",
+    [
+        # Testcase 1: No cached data
+        (
+                None,
+                3600,
+                True,
+        ),
+        # Testcase 2: Cached data with no timestamp
+        (
+                {"asn": {}},
+                3600,
+                True,
+        ),
+        # Testcase 3: Cached data with old timestamp
+        (
+                {"asn": {"timestamp": time.time() - 7200}},
+                3600,
+                True,
+        ),
+        # Testcase 4: Cached data with recent timestamp
+        (
+                {"asn": {"timestamp": time.time() - 1800}},
+                3600,
+                False,
+        ),
+    ],
+)
+def test_update_asn(mock_db, cached_data, 
+                    update_period, expected_result):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
+    result = asn_info.update_asn(cached_data, update_period)
+    assert result == expected_result
 
-        return ip_info
 
-    def cache_ip_range(self, ip: str):
-        """
-        Get the range of the given ip and
-        cache the asn of the whole ip range
-        """
-        if not ip:
-            return False
+@pytest.mark.parametrize(
+    "ip_address, is_ignored, api_status_code, api_text, "
+    "mock_get_side_effect, expected_result",
+    [
+        # Testcase 1: Valid IP with ASN info
+        (
+                "8.8.8.8",
+                False,
+                200,
+                json.dumps({"as": "AS15169 Google LLC"}),
+                None,
+                {"asn": {"number": "AS15169", "org": "Google LLC"}},
+        ),
+        # Testcase 2: Valid IP without ASN info
+        (
+                "1.1.1.1",
+                False,
+                200,
+                json.dumps({"as": ""}),
+                None,
+                None,
+        ),
+        # Testcase 3: API request fails
+        (
+                "192.168.1.1",
+                False,
+                404,
+                "",
+                None,
+                {},
+        ),
+        # Testcase 4: Ignored IP
+        (
+                "127.0.0.1",
+                True,
+                None,
+                None,
+                None,
+                {},
+        ),
+    ],
+)
+def test_get_asn_online(
+        mock_db,
+        ip_address,
+        is_ignored,
+        api_status_code,
+        api_text,
+        mock_get_side_effect,
+        expected_result,
+):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
 
-        try:
-            # Cache the range of this ip
-            whois_info: dict = ipwhois.IPWhois(address=ip).lookup_rdap()
-            asnorg = whois_info.get("asn_description", False)
-            asn_cidr = whois_info.get("asn_cidr", False)
-            asn_number = whois_info.get("asn", False)
+    with patch(
+            "slips_files.common.slips_utils.utils.is_ignored_ip"
+    ) as mock_is_ignored_ip:
+        mock_is_ignored_ip.return_value = is_ignored
 
-            if asnorg and asn_cidr not in ("", "NA"):
-                self.db.set_asn_cache(asnorg, asn_cidr, asn_number)
-                asn_info = {
-                    "asn": {"number": f"AS{asn_number}", "org": asnorg}
-                }
-                return asn_info
-        except (
-            ipwhois.exceptions.IPDefinedError,
-            ipwhois.exceptions.HTTPLookupError,
-            ipwhois.exceptions.ASNRegistryError,
-            ipwhois.exceptions.ASNParseError,
-        ):
-            # private ip or RDAP lookup failed. don't cache
-            # or ASN lookup failed with no more methods to try
-            return False
+        with patch("requests.get") as mock_get:
+            mock_response = Mock()
+            mock_response.status_code = api_status_code
+            mock_response.text = api_text
+            mock_get.return_value = mock_response
+            mock_get.side_effect = mock_get_side_effect
 
-    def get_asn_online(self, ip):
-        """
-        Get asn of an ip using ip-api.com only if the asn wasn't found in our offline db
-        """
+            result = asn_info.get_asn_online(ip_address)
+            assert result == expected_result
 
-        asn = {}
-        if utils.is_ignored_ip(ip):
-            return asn
 
-        url = "http://ip-api.com/json/"
-        try:
-            response = requests.get(f"{url}/{ip}", timeout=5)
-            if response.status_code != 200:
-                return asn
+@pytest.mark.parametrize(
+    "ip, cached_ip_info, asn, expected_call",
+    [
+        # Testcase 1: Update with new ASN info
+        (
+                "192.168.1.1",
+                {},
+                {"asn": {"number": "AS12345", "org": "Test Org"}},
+                ("192.168.1.1", {
+                    "asn": {"number": "AS12345", "org": "Test Org"},
+                    "timestamp": 1625097600,
+                }),
+        ),
+        # Testcase 2: Update existing ASN info
+        (
+                "10.0.0.1",
+                {"country": "US"},
+                {"asn": {"number": "AS67890", "org": "Another Org"}},
+                ("10.0.0.1", {
+                    "country": "US",
+                    "asn": {"number": "AS67890", "org": "Another Org"},
+                    "timestamp": 1625097600,
+                }),
+        ),
+        # Testcase 3: Update with empty ASN info
+        (
+                "172.16.0.1",
+                {"some_key": "some_value"},
+                {},
+                ("172.16.0.1", {
+                    "some_key": "some_value",
+                    "timestamp": 1625097600,
+                }),
+        ),
+    ],
+)
+def test_update_ip_info(mock_db, ip, cached_ip_info, asn, expected_call):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
 
-            ip_info = json.loads(response.text)
-            if "as" not in ip_info:
-                return asn
+    with patch("time.time", return_value=1625097600):
+        asn_info.update_ip_info(ip, cached_ip_info, asn)
 
-            asn_info = ip_info["as"].split()
-            if asn_info == []:
-                return
+        mock_db.set_ip_info.assert_called_once_with(*expected_call)
+        expected_cached_ip_info = expected_call[1]
+        assert cached_ip_info == expected_cached_ip_info
 
-            # usually it's somthing like AS15169 Google LLC
-            # separate the org name
-            asn.update(
-                {"asn": {"number": asn_info[0], "org": " ".join(asn_info[1:])}}
-            )
-            return asn
-        except (
-            requests.exceptions.ReadTimeout,
-            requests.exceptions.ConnectionError,
-            json.decoder.JSONDecodeError,
-            KeyError,
-            IndexError,
-        ):
-            # comes here if slips fails to get the as info from the response
-            # OR gets it correctly, but the info doesn't contain the fields slip sis expecting
-            pass
 
-        return asn
+@pytest.mark.parametrize(
+    "ip, cached_ip_info, cached_asn, cache_ip_range_result, "
+    "geolite_asn, online_asn, expected_result, expected_calls",
+    [
+        # Testcase 1: ASN found in cached range
+        (
+                "192.168.1.1",
+                {},
+                {"asn": {"number": "AS12345", "org": "Cached Org"}},
+                None,
+                None,
+                None,
+                {"asn": {"number": "AS12345", "org": "Cached Org"}},
+                [call.get_cached_asn("192.168.1.1")]
+        ),
+        # Testcase 2: ASN found by cache_ip_range
+        (
+                "8.8.8.8",
+                {},
+                None,
+                {"asn": {"number": "AS15169", "org": "Google LLC"}},
+                None,
+                None,
+                {"asn": {"number": "AS15169", "org": "Google LLC"}},
+                [call.get_cached_asn("8.8.8.8"), 
+                 call.cache_ip_range("8.8.8.8")]
+        ),
+        # Testcase 3: ASN found in GeoLite database
+        (
+                "1.1.1.1",
+                {},
+                None,
+                None,
+                {"asn": {"number": "AS13335", "org": "Cloudflare, Inc."}},
+                None,
+                {"asn": {"number": "AS13335", "org": "Cloudflare, Inc."}},
+                [call.get_cached_asn("1.1.1.1"), 
+                 call.cache_ip_range("1.1.1.1"),
+                 call.get_asn_info_from_geolite("1.1.1.1")]
+        ),
+        # Testcase 4: ASN found online
+        (
+                "203.0.113.1",
+                {},
+                None,
+                None,
+                None,
+                {"asn": {"number": "AS64496", "org": "Example ISP"}},
+                {"asn": {"number": "AS64496", "org": "Example ISP"}},
+                [call.get_cached_asn("203.0.113.1"), 
+                 call.cache_ip_range("203.0.113.1"),
+                 call.get_asn_info_from_geolite("203.0.113.1"), 
+                 call.get_asn_online("203.0.113.1")]
+        ),
+    ],
+)
+def test_get_asn_with_result(
+        mock_db,
+        ip,
+        cached_ip_info,
+        cached_asn,
+        cache_ip_range_result,
+        geolite_asn,
+        online_asn,
+        expected_result,
+        expected_calls
+):
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
 
-    def update_ip_info(self, ip, cached_ip_info, asn):
-        """
-        if an asn is found using this module, we update the IP's
-        info in the db in 'IPsinfo' key with
-        the ASN info we found
-        asn is a dict with 2 keys 'number' and 'org'
-        cached_ip_info: info from 'IPsInfo' key passed from ip_info.py module
-        """
-        asn.update({"timestamp": time.time()})
-        cached_ip_info.update(asn)
-        # store the ASN we found in 'IPsInfo'
-        self.db.set_ip_info(ip, cached_ip_info)
+    with patch.object(asn_info, "get_cached_asn", 
+                      return_value=cached_asn) as mock_get_cached_asn, \
+            patch.object(asn_info, "cache_ip_range", 
+                         return_value=cache_ip_range_result) as mock_cache_ip_range, \
+            patch.object(asn_info, "get_asn_info_from_geolite", 
+                         return_value=geolite_asn) as mock_get_geolite, \
+            patch.object(asn_info, "get_asn_online", 
+                         return_value=online_asn) as mock_get_online, \
+            patch.object(asn_info, "update_ip_info") as mock_update_ip_info:
+        asn_info.get_asn(ip, cached_ip_info)
 
-    def get_asn(self, ip, cached_ip_info):
-        """
-        Gets ASN info about IP, either cached, from our offline mmdb or from ip-api.com
-        """
-        # do we have asn cached for this range?
-        if cached_asn := self.get_cached_asn(ip):
-            self.update_ip_info(ip, cached_ip_info, cached_asn)
-            return
+        actual_calls = mock_get_cached_asn.mock_calls + mock_cache_ip_range.mock_calls + \
+                       mock_get_geolite.mock_calls + mock_get_online.mock_calls
+        assert actual_calls == expected_calls
 
-        else:
-            # now we have 2 options, either search for the ASN in our offline db, or online
-            # either way we need to cache the asn of this ip's range so we don't search for ips in the same range
-            # cache this range in our redis db
-            if asn := self.cache_ip_range(ip):
-                # range is cached and we managed to get the number and org of the given ip using whois
-                # no need to search online or offline
-                self.update_ip_info(ip, cached_ip_info, asn)
-                return
+        mock_update_ip_info.assert_called_once_with(ip, cached_ip_info, expected_result)
 
-            # we don't have it cached in our db, get it from geolite
-            if asn := self.get_asn_info_from_geolite(ip):
-                self.update_ip_info(ip, cached_ip_info, asn)
-                return
 
-            # can't find asn in mmdb or using whois library, try using ip-info
-            if asn := self.get_asn_online(ip):
-                # found it online
-                self.update_ip_info(ip, cached_ip_info, asn)
-                return
+def test_get_asn_without_result(mock_db):
+    """Testcase: ASN not found anywhere."""
+    ip = "10.0.0.1"
+    cached_ip_info = {}
+    expected_calls = [
+        call.get_cached_asn("10.0.0.1"),
+        call.cache_ip_range("10.0.0.1"),
+        call.get_asn_info_from_geolite("10.0.0.1"),
+        call.get_asn_online("10.0.0.1"),
+    ]
+
+    asn_info = ModuleFactory().create_asn_obj(mock_db)
+
+    with patch.object(asn_info, "get_cached_asn", 
+                      return_value=None) as mock_get_cached_asn, \
+            patch.object(asn_info, "cache_ip_range", 
+                         return_value=None) as mock_cache_ip_range, \
+            patch.object(asn_info, "get_asn_info_from_geolite", 
+                         return_value=None) as mock_get_geolite, \
+            patch.object(asn_info, "get_asn_online", 
+                         return_value=None) as mock_get_online, \
+            patch.object(asn_info, "update_ip_info") as mock_update_ip_info:
+        asn_info.get_asn(ip, cached_ip_info)
+
+        actual_calls = mock_get_cached_asn.mock_calls + mock_cache_ip_range.mock_calls + \
+                       mock_get_geolite.mock_calls + mock_get_online.mock_calls
+        assert actual_calls == expected_calls
+
+        mock_update_ip_info.assert_not_called()
